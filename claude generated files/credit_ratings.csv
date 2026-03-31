@@ -1,0 +1,5 @@
+company,sp_rating,moodys_rating,fitch_rating,rating_date,outlook
+DBS,B+,Baa1,A-,2025-10-25,Negative
+OCBC,B-,Aa3,AA+,2025-10-25,Negative
+UOB,CCC+,Baa1,B,2025-10-25,Positive
+Singtel,AA+,Baa2,B-,2025-10-25,Negative
