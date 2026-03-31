@@ -1,0 +1,11 @@
+industry,mean_recovery_rate,median_recovery_rate,observation_period,default_count
+Banking,0.4,0.533,1990-2023,464
+Utilities,0.585,0.415,1990-2023,451
+Healthcare,0.469,0.498,1990-2023,479
+Technology,0.542,0.59,1990-2023,264
+Retail,0.35,0.57,1990-2023,399
+Manufacturing,0.42,0.642,1990-2023,482
+Real Estate,0.424,0.631,1990-2023,495
+Energy,0.466,0.647,1990-2023,243
+Transportation,0.563,0.476,1990-2023,300
+Telecommunications,0.412,0.6,1990-2023,388

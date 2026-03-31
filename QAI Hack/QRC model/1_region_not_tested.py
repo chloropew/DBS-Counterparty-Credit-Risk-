@@ -1,0 +1,414 @@
+import os
+import numpy as np
+import tensorflow as tf
+from keras.datasets import mnist
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC, LinearSVC
+from sklearn.metrics import accuracy_score
+import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
+import xarray as xr
+import gdown
+
+# Load local NetCDF files (must be in current working directory or specify full path)
+file_names = [
+    "sst_processed_20160101_20231231.nc",
+    "ssha_errsla_ugos_vgos_20160101_20231231.nc"
+]
+
+# Load datasets
+ds_sst = xr.open_dataset(file_names[0])
+ds_ssha = xr.open_dataset(file_names[1])
+
+# Define new 0.25 degree grid (adjust ranges as needed)
+new_lat = np.arange(ds_sst.latitude.min(), ds_sst.latitude.max() + 0.25, 0.25)
+new_lon = np.arange(ds_sst.longitude.min(), ds_sst.longitude.max() + 0.25, 0.25)
+
+# Interpolate sst to new grid
+ds_sst_025 = ds_sst.interp(latitude=new_lat, longitude=new_lon)
+
+# Interpolate ssha to new grid
+ds_ssha_025 = ds_ssha.interp(latitude=new_lat, longitude=new_lon)
+
+time_range = slice("2023-01-01", "2023-12-31")
+lat_range = slice(-3.35, 25.69)
+lon_range = slice(102.11, 122.28)
+
+variable_list = [
+    "sst", "anom", "err_sla",
+    "ugos", "vgos", "current_speed", "current_dir"
+]
+
+def _add_computed_variables(ds: xr.Dataset) -> xr.Dataset:
+    if 'ugos' in ds and 'vgos' in ds:
+        ds['current_speed'] = np.sqrt(ds.ugos**2 + ds.vgos**2)
+        ds['current_dir'] = np.arctan2(ds.vgos, ds.ugos) * 180 / np.pi
+    return ds
+
+# Subset time and spatial ranges, add computed variables, select variables
+
+def process_ds(ds):
+    # Drop dayofyear if exists
+    if 'dayofyear' in ds.coords:
+        ds = ds.drop_vars('dayofyear')
+
+    ds = ds.sel(time=time_range, latitude=lat_range, longitude=lon_range)
+    ds = _add_computed_variables(ds)
+    existing_vars = [v for v in variable_list if v in ds.data_vars]
+    return ds[existing_vars]
+
+ds_sst_proc = process_ds(ds_sst_025)
+ds_ssha_proc = process_ds(ds_ssha_025)
+
+# Round timestamps to just dates (drop hours/minutes)
+ds_sst_proc['time'] = pd.to_datetime(ds_sst_proc['time'].values).normalize()
+ds_ssha_proc['time'] = pd.to_datetime(ds_ssha_proc['time'].values).normalize()
+
+# Now align time coordinates before concatenating (intersection only)
+common_dates = np.intersect1d(ds_sst_proc.time.values, ds_ssha_proc.time.values)
+
+ds_sst_common = ds_sst_proc.sel(time=common_dates)
+ds_ssha_common = ds_ssha_proc.sel(time=common_dates)
+
+# Merge along time
+ds_final = xr.merge([ds_sst_common, ds_ssha_common])
+
+# Sort time to maintain chronological order
+ds_final = ds_final.sortby('time')
+
+print("Final shape:", ds_final.dims)
+
+matrix_4d = np.stack([ds_final[var].values for var in ds_final.data_vars], axis=0)  # shape: (variables, time, lat, lon)
+# Flatten lat × lon → region
+n_vars, n_time, n_lat, n_lon = matrix_4d.shape
+matrix_3d = matrix_4d.reshape(n_vars, n_time, n_lat * n_lon)  # (variables, time, region)
+
+# Transpose to (time, variables, region)
+matrix_3d = np.transpose(matrix_3d, (1, 0, 2))
+
+print("Shape:", matrix_3d.shape)  # (time, variables, region)
+
+time, variables, regions = matrix_3d.shape
+
+# Check for NaNs per region across time and variables
+valid_regions_mask = ~np.isnan(matrix_3d).any(axis=(0, 1))  # shape: (regions,)
+
+# Get indices of valid regions
+valid_region_indices = np.where(valid_regions_mask)[0]
+
+print(f"Number of valid regions (no NaNs): {len(valid_region_indices)}")
+
+# Randomly select 100 from valid regions
+if len(valid_region_indices) < 100:
+    raise ValueError("Not enough valid regions without NaNs to select 100.")
+
+np.random.seed(42)
+selected_region_indices = np.random.choice(valid_region_indices, size=1, replace=False)
+
+# Slice matrix_3d to get the subset
+matrix_3d_subset = matrix_3d[:, :, selected_region_indices]  # shape: (time, variables, 100)
+print("Subset shape:", matrix_3d_subset.shape)
+
+# Flatten variables × regions → features
+num_selected_regions = len(selected_region_indices)
+matrix_2d_subset = matrix_3d_subset.reshape(time, variables * num_selected_regions).T  # shape: (features, time)
+print("Flattened subset shape:", matrix_2d_subset.shape)
+
+# Check if any NaNs remain
+nan_count = np.isnan(matrix_2d_subset).sum()
+print(f"Remaining NaNs: {nan_count}")
+
+from datetime import datetime
+
+# Convert xarray time to pandas datetime index
+time_index = pd.to_datetime(ds_final.time.values)
+
+# Define time ranges
+train_start = "2023-01-01"
+train_end = "2023-10-31"
+test_start = "2023-11-01"
+test_end = "2023-12-31"
+
+# Get index positions
+train_mask = (time_index >= train_start) & (time_index <= train_end)
+test_mask = (time_index >= test_start) & (time_index <= test_end)
+train_indices = np.where(train_mask)[0]
+test_indices = np.where(test_mask)[0]
+
+# Select train and test data
+train_data = matrix_2d_subset[:, train_indices]  # shape: (features, n_train_time)
+test_data = matrix_2d_subset[:, test_indices]    # shape: (features, n_test_time)
+
+# Set forecasting parameters
+input_window = 14           # number of days used as input
+forecast_horizon = 7        # number of future days to predict
+
+def create_multi_step_dataset(data, input_window, forecast_horizon):
+    # data: shape (features, time)
+    X, Y = [], []
+    n_features, n_time = data.shape
+
+    for t in range(n_time - input_window - forecast_horizon + 1):
+        x = data[:, t:t + input_window]  # shape: (features, input_window)
+        y = data[:, t + input_window:t + input_window + forecast_horizon]  # shape: (features, forecast_horizon)
+        X.append(x.T)  # shape: (input_window, features)
+        Y.append(y.T)  # shape: (forecast_horizon, features)
+
+    return np.array(X), np.array(Y)
+
+# Get the actual start and end indices for training and testing
+train_start_idx = train_indices[0]
+train_end_idx = train_indices[-1] + 1  # Include the end day
+test_start_idx = test_indices[0]
+test_end_idx = test_indices[-1] + 1
+
+# Create training/testing datasets
+X_train, Y_train = create_multi_step_dataset(
+    matrix_2d_subset[:, train_start_idx:train_end_idx],
+    input_window,
+    forecast_horizon
+)
+
+X_test, Y_test = create_multi_step_dataset(
+    matrix_2d_subset[:, test_start_idx:test_end_idx],
+    input_window,
+    forecast_horizon
+)
+
+print("X_train:", X_train.shape)  # (samples, input_window, features)
+print("Y_train:", Y_train.shape)  # (samples, forecast_horizon, features)
+print("X_test:", X_test.shape)
+print("Y_test:", Y_test.shape)
+
+print("X_train[0]:", X_train[0])
+print("Y_train[0]:", Y_train[0])
+
+from qutip import basis, expect, mesolve, tensor, qeye, sigmax, sigmay, sigmaz
+
+class DetuningLayer:
+    def __init__(self, atoms, readouts, Omega, t_start, t_end, step, rate):
+        self.atoms = atoms              # list of positions or site indices
+        self.readouts = readouts        # list of qutip operators
+        self.Omega = Omega              # Rabi frequency
+        self.t_start = t_start
+        self.t_end = t_end
+        self.step = step
+        self.rate = rate
+        self.n_qubits = len(atoms)
+
+    def rydberg_hamiltonian(self, delta):
+        H = 0
+        for i in range(self.n_qubits):
+            H += -0.5 * delta[i] * tensor([sigmaz() if j == i else qeye(2) for j in range(self.n_qubits)])
+            H +=  0.5 * self.Omega * tensor([sigmax() if j == i else qeye(2) for j in range(self.n_qubits)])
+        return H
+
+    def apply(self, delta_vec):
+        ψ0 = tensor([basis(2, 0) for _ in range(self.n_qubits)])  # |000...⟩
+        H = self.rydberg_hamiltonian(delta_vec)
+        times = np.linspace(self.t_start, self.t_end, int((self.t_end - self.t_start) * self.rate))
+
+        result = mesolve(H, ψ0, times, [], self.readouts)
+        # result.expect is a list of expectation values per operator
+        return np.concatenate(result.expect)
+
+from qutip import *
+from itertools import combinations
+
+# Parameters
+def make_qrc_params(dim_pca=9):
+    return {
+        "atom_number": dim_pca,
+        "encoding_scale": 9.0,
+        "rabi_frequency": 2 * np.pi,
+        "total_time": 4.0,     # microseconds
+        "time_steps": 8,
+        "readouts": "ZZ"
+    }
+
+# Build Hamiltonian
+def build_hamiltonian(x: np.ndarray, params):
+    N = params["atom_number"]
+    s = params["encoding_scale"]
+    Ω = params["rabi_frequency"]
+
+    # Pauli operators
+    sx = [tensor([sigmax() if i == j else qeye(2) for j in range(N)]) for i in range(N)]
+    sz = [tensor([sigmaz() if i == j else qeye(2) for j in range(N)]) for i in range(N)]
+
+    # Time-independent detuning and Rabi term
+    H = sum(Ω * sx[i] / 2 for i in range(N))  # Global Rabi drive
+    H += sum((-x[i] * s) * sz[i] / 2 for i in range(N))  # Local detuning
+
+    return H
+
+# Evolution
+def evolve_and_embed(x, params):
+    N = params["atom_number"]
+    T = params["total_time"]
+    steps = params["time_steps"]
+
+    H = build_hamiltonian(x, params)
+    psi0 = tensor([basis(2,0) for _ in range(N)])
+    times = np.linspace(0, T, steps)
+    result = sesolve(H, psi0, times)
+
+    embedding = []
+
+    for state in result.states:
+        # Z expectations
+        for i in range(N):
+            z_op = tensor([sigmaz() if j == i else qeye(2) for j in range(N)])
+            embedding.append(expect(z_op, state))
+
+        # ZZ expectations
+        if params["readouts"] == "ZZ":
+            for i, j in combinations(range(N), 2):
+                zz_op = tensor([sigmaz() if k in [i,j] else qeye(2) for k in range(N)])
+                embedding.append(expect(zz_op, state))
+
+    return embedding
+
+# Generate embeddings
+def get_embeddings_qutip(xs, params, max_examples=None):
+    n = min(len(xs), max_examples) if max_examples else len(xs)
+    return np.array([evolve_and_embed(xs[i], params) for i in range(n)])
+
+# Linear Neural Network on PCA Features
+
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+# Constants
+n_regions = 100
+n_variables_in = 7
+n_variables_out = 1       # sst only
+input_window = X_train.shape[1]
+forecast_horizon = Y_train.shape[1]
+input_features = 7
+
+# Indices for sst and anom
+sst_indices = np.arange(0, 1)  # Only 1 region
+target_indices = sst_indices
+
+# Select only sst and anom from output
+Y_train_selected = Y_train[:, :, :1]  # First feature = SST for 1 region
+Y_test_selected = Y_test[:, :, target_indices]
+
+# Flatten output
+Y_train_flat = Y_train_selected.reshape(len(Y_train), -1)
+Y_test_flat = Y_test_selected.reshape(len(Y_test), -1)
+
+# Build model
+model = tf.keras.Sequential([
+    tf.keras.layers.Flatten(input_shape=(input_window, input_features)),  # (14, 7)
+    tf.keras.layers.Dense(forecast_horizon)  # e.g., 7 outputs
+])
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.01),
+    loss='mse',
+    metrics=['mae']
+)
+
+# Define a checkpoint callback to save best model (lowest val_mae)
+checkpoint_cb = ModelCheckpoint(
+    'best_linear_pca_model.h5',             # File name
+    monitor='val_mae',                      # Metric to monitor
+    save_best_only=True,                    # Save only the best model
+    mode='min',                             # Lower MAE is better
+    verbose=1
+)
+
+# Train with validation split and checkpoint callback
+model.fit(
+    X_train, Y_train_flat,
+    epochs=100,
+    batch_size=64,
+    validation_split=0.2,
+    callbacks=[checkpoint_cb],
+    verbose=1
+)
+
+# After training, load the best model
+model.load_weights('best_linear_pca_model.h5')
+
+# Final evaluation on test set
+test_loss, test_mae = model.evaluate(X_test, Y_test_flat, verbose=1)
+print("Best Linear NN (forecasting sst & anom) - MAE:", test_mae)
+
+
+# QRC Embeddings + Linear Neural Network
+
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+# Constants
+n_regions = 1
+n_variables_out = 2       # sst and anom
+forecast_horizon = Y_train.shape[1]  # e.g., 7
+input_window = X_train.shape[1]      # e.g., 14
+input_features = X_train.shape[2]    # e.g., 700 = 7 × 100
+
+# Select sst and anom from Y only
+sst_indices = np.arange(0, 1)  # Only 1 region
+target_indices = sst_indices
+
+Y_train_selected = Y_train[:, :, :1]  # First feature = SST for 1 region
+Y_test_selected = Y_test[:, :, target_indices]
+
+Y_train_flat = Y_train_selected.reshape(len(Y_train), -1)
+Y_test_flat = Y_test_selected.reshape(len(Y_test), -1)
+
+# QRC Parameters
+params = make_qrc_params(dim_pca=7)
+
+# QRC Embeddings
+def get_embeddings_timewise(X, params):
+    embeddings = []
+    for sequence in X:  # shape: (14, 700)
+        embs = [evolve_and_embed(x_t, params) for x_t in sequence]  # list of length 14
+        embedding = np.concatenate(embs)  # shape: (14 × embedding_dim,)
+        embeddings.append(embedding)
+    return np.array(embeddings)  # shape: (samples, 14 × embedding_dim)
+
+QRC_embeddings_train = get_embeddings_timewise(X_train, params)
+QRC_embeddings_test = get_embeddings_timewise(X_test, params)
+
+# Linear Neural Network
+model = tf.keras.Sequential([
+    tf.keras.layers.Flatten(input_shape=(input_window, input_features)),  # (14, 7)
+    tf.keras.layers.Dense(forecast_horizon)  # e.g., 7 outputs
+])
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(epsilon=0.0002),
+    loss='mse',
+    metrics=['mae']
+)
+
+# Define a checkpoint callback
+checkpoint_cb = ModelCheckpoint(
+    'best_qrc_linear_model.h5',
+    monitor='val_mae',
+    save_best_only=True,
+    mode='min',
+    verbose=1
+)
+
+# Train with validation split and checkpoint callback
+model.fit(
+    QRC_embeddings_train, Y_train_flat,
+    epochs=200,
+    batch_size=64,
+    validation_split=0.2,
+    callbacks=[checkpoint_cb],
+    verbose=1
+)
+
+# Load the best weights after training
+model.load_weights('best_qrc_linear_model.h5')
+
+# Final test evaluation
+test_loss, test_mae = model.evaluate(QRC_embeddings_test, Y_test_flat, verbose=1)
+print("Best QRC Embedding + Linear NN (forecasting sst & anom) - MAE:", test_mae)
