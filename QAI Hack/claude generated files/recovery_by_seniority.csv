@@ -1,6 +1,0 @@
-seniority,mean_recovery_rate,median_recovery_rate,std_dev,sample_size
-Senior Secured,0.65,0.68,0.25,1245
-Senior Unsecured,0.48,0.5,0.28,2103
-Senior Subordinated,0.35,0.38,0.24,456
-Subordinated,0.31,0.32,0.23,789
-Junior Subordinated,0.24,0.26,0.2,234
